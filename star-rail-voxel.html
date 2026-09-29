@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>星穹列車體素模型</title>
+<style>
+  :root {
+    --bg: #05060f;
+    --panel: rgba(14, 16, 34, .72);
+    --text: #eef0ff;
+    --muted: #9aa3c7;
+    --gold: #e8c26a;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); overflow: hidden;
+    font-family: system-ui, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 16px; top: 16px; max-width: calc(100% - 32px); pointer-events: none; }
+  #hud h1 { margin: 0; font-size: clamp(18px, 3vw, 28px); letter-spacing: .08em; color: var(--gold);
+    text-shadow: 0 0 12px rgba(232, 194, 106, .5); }
+  #hud p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  #controls { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; gap: 8px;
+    flex-wrap: wrap; justify-content: center; width: max-content; max-width: calc(100% - 32px); }
+  button { background: var(--panel); color: var(--text); border: 1px solid rgba(232, 194, 106, .45);
+    border-radius: 999px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer; backdrop-filter: blur(6px); }
+  button:hover { border-color: var(--gold); }
+  button[aria-pressed="true"] { background: rgba(232, 194, 106, .22); border-color: var(--gold); }
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 14px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="loading">星穹列車即將出發…</div>
+<div id="hud">
+  <h1>崩壞：星穹鐵道 · 體素模型</h1>
+  <p>星穹列車與列車長帕姆 — 拖曳旋轉，滾輪縮放</p>
+</div>
+<div id="controls">
+  <button id="btn-run" aria-pressed="true">列車行駛</button>
+  <button id="btn-rotate" aria-pressed="false">自動旋轉</button>
+  <button id="btn-view">視角：全景</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// ---------- Palette ----------
+const PAL = {
+  crimson: '#8e1b2b', crimsonDark: '#5e0f1c', roof: '#2a0c14',
+  gold: '#e0b458', goldDark: '#a67c2e',
+  iron: '#23232b', steel: '#4a4d5c', navy: '#1f2442',
+  window: '#ffd98a', lamp: '#fff4c8', cyan: '#6fe3ff',
+  white: '#f4f2f8', ear: '#a9b1d6', earTip: '#6d76a3', black: '#111118', pink: '#f3a6b8',
+};
+// Colours rendered unlit and bright enough to bloom
+const GLOW = new Set([PAL.window, PAL.lamp, PAL.cyan]);
+
+// ---------- Voxel helper ----------
+class Voxels {
+  constructor() { this.map = new Map(); }
+  key(x, y, z) { return x + ',' + y + ',' + z; }
+  set(x, y, z, c) { this.map.set(this.key(x, y, z), c); }
+  has(x, y, z) { return this.map.has(this.key(x, y, z)); }
+  box(x0, y0, z0, x1, y1, z1, c) {
+    for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) this.set(x, y, z, c);
+  }
+  // Cylinder along X (circle in the Y-Z plane)
+  cylX(x0, x1, cy, cz, r, c) {
+    for (let x = x0; x <= x1; x++)
+      for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++)
+        for (let z = Math.floor(cz - r); z <= Math.ceil(cz + r); z++)
+          if ((y - cy) ** 2 + (z - cz) ** 2 <= r * r) this.set(x, y, z, c);
+  }
+  // Cylinder along Y (circle in the X-Z plane)
+  cylY(y0, y1, cx, cz, r, c) {
+    for (let y = y0; y <= y1; y++)
+      for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++)
+        for (let z = Math.floor(cz - r); z <= Math.ceil(cz + r); z++)
+          if ((x - cx) ** 2 + (z - cz) ** 2 <= r * r) this.set(x, y, z, c);
+  }
+  // Disc / ring along Z (circle in the X-Y plane), optional inner radius
+  discZ(z0, z1, cx, cy, r, c, rIn = -1) {
+    for (let z = z0; z <= z1; z++)
+      for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++)
+        for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+          const d = (x - cx) ** 2 + (y - cy) ** 2;
+          if (d <= r * r && d > rIn * Math.abs(rIn)) this.set(x, y, z, c);
+        }
+  }
+  ellipsoid(cx, cy, cz, rx, ry, rz, c) {
+    for (let x = Math.floor(cx - rx); x <= Math.ceil(cx + rx); x++)
+      for (let y = Math.floor(cy - ry); y <= Math.ceil(cy + ry); y++)
+        for (let z = Math.floor(cz - rz); z <= Math.ceil(cz + rz); z++)
+          if (((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 + ((z - cz) / rz) ** 2 <= 1) this.set(x, y, z, c);
+  }
+  // Recolour the front-most (largest z) voxel in a column
+  front(x, y, c) {
+    for (let z = 40; z >= -40; z--) if (this.has(x, y, z)) { this.set(x, y, z, c); return; }
+  }
+  // Build instanced meshes, skipping fully hidden voxels
+  build(size, { fog = true } = {}) {
+    const solid = [], glow = [];
+    const dirs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    for (const [k, c] of this.map) {
+      const [x, y, z] = k.split(',').map(Number);
+      if (dirs.every(([dx, dy, dz]) => this.has(x + dx, y + dy, z + dz))) continue;
+      (GLOW.has(c) ? glow : solid).push([x, y, z, c]);
+    }
+    const group = new THREE.Group();
+    const geo = new THREE.BoxGeometry(size, size, size);
+    const make = (list, mat) => {
+      if (!list.length) return null;
+      const mesh = new THREE.InstancedMesh(geo, mat, list.length);
+      const o = new THREE.Object3D(), col = new THREE.Color();
+      list.forEach(([x, y, z, c], i) => {
+        o.position.set(x * size, y * size, z * size);
+        o.updateMatrix();
+        mesh.setMatrixAt(i, o.matrix);
+        mesh.setColorAt(i, col.set(c));
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.instanceColor.needsUpdate = true;
+      group.add(mesh);
+      return mesh;
+    };
+    const s = make(solid, new THREE.MeshStandardMaterial({ roughness: .55, metalness: .15, fog }));
+    if (s) { s.castShadow = true; s.receiveShadow = true; }
+    const glowMat = new THREE.MeshBasicMaterial({ toneMapped: false, fog });
+    glowMat.color.setScalar(1.5);
+    make(glow, glowMat);
+    return group;
+  }
+}
+
+// ---------- Models ----------
+function wheel(v, cx, cy, z) {
+  v.discZ(z, z, cx, cy, 3.2, PAL.goldDark, 2.3);
+  v.discZ(z, z, cx, cy, 2.3, PAL.iron);
+  for (let i = -2; i <= 2; i++) { v.set(cx + i, cy, z, PAL.steel); v.set(cx, cy + i, z, PAL.steel); }
+  v.set(cx, cy, z, PAL.gold);
+}
+
+function roof(v, x0, x1) {
+  v.box(x0 - 1, 18, 0, x1 + 1, 18, 10, PAL.roof);
+  v.box(x0 - 1, 18, 0, x1 + 1, 18, 0, PAL.gold);
+  v.box(x0 - 1, 18, 10, x1 + 1, 18, 10, PAL.gold);
+  v.box(x0, 19, 1, x1, 19, 9, PAL.roof);
+  v.box(x0 + 1, 20, 3, x1 - 1, 20, 7, PAL.roof);
+}
+
+function buildLocomotive() {
+  const v = new Voxels();
+  for (const wx of [4, 10, 17, 23]) { wheel(v, wx, 3, 0); wheel(v, wx, 3, 10); }
+  // Chassis and frame
+  v.box(0, 3, 1, 27, 4, 9, PAL.iron);
+  v.box(14, 5, 2, 26, 7, 8, PAL.crimsonDark);
+  v.box(1, 2, 5, 26, 2, 5, PAL.cyan);
+  // Cabin
+  v.box(0, 5, 1, 13, 17, 9, PAL.crimson);
+  v.box(0, 5, 0, 13, 5, 10, PAL.gold);
+  v.box(0, 11, 0, 13, 11, 10, PAL.gold);
+  for (const [a, b] of [[2, 4], [6, 8], [10, 11]]) {
+    v.box(a, 13, 1, b, 16, 1, PAL.window);
+    v.box(a, 13, 9, b, 16, 9, PAL.window);
+  }
+  v.box(0, 13, 4, 0, 16, 6, PAL.window);
+  roof(v, 0, 13);
+  // Boiler with gold bands
+  v.cylX(14, 26, 11, 5, 4.6, PAL.crimson);
+  for (const x of [16, 20, 24]) v.cylX(x, x, 11, 5, 5.2, PAL.gold);
+  // Smokebox front and headlamp
+  v.cylX(27, 27, 11, 5, 5.2, PAL.gold);
+  v.cylX(27, 27, 11, 5, 3.7, PAL.navy);
+  v.cylX(28, 28, 11, 5, 1.5, PAL.lamp);
+  // Chimney and dome
+  v.cylY(15, 20, 21, 5, 1.6, PAL.iron);
+  v.cylY(21, 21, 21, 5, 2.3, PAL.gold);
+  v.ellipsoid(17, 15.5, 5, 1.6, 1.6, 1.6, PAL.gold);
+  // Cowcatcher
+  for (let i = 0; i < 4; i++) v.box(28 + i, 3, 1 + i, 28 + i, 6 - i, 9 - i, PAL.goldDark);
+  return v;
+}
+
+function buildCarriage(L = 24) {
+  const v = new Voxels();
+  for (const wx of [3, 8, L - 8, L - 3]) { wheel(v, wx, 3, 0); wheel(v, wx, 3, 10); }
+  v.box(0, 3, 1, L, 4, 9, PAL.iron);
+  v.box(1, 2, 5, L - 1, 2, 5, PAL.cyan);
+  v.box(0, 5, 1, L, 17, 9, PAL.crimson);
+  v.box(0, 5, 0, L, 5, 10, PAL.gold);
+  v.box(0, 11, 0, L, 11, 10, PAL.gold);
+  v.box(0, 16, 1, L, 17, 9, PAL.crimsonDark);
+  v.box(0, 16, 0, L, 16, 0, PAL.gold);
+  v.box(0, 16, 10, L, 16, 10, PAL.gold);
+  for (let x = 2; x + 2 <= L - 1; x += 5) {
+    v.box(x, 12, 1, x + 2, 15, 1, PAL.window);
+    v.box(x, 12, 9, x + 2, 15, 9, PAL.window);
+  }
+  for (const x of [0, L]) { v.box(x, 6, 4, x, 15, 6, PAL.crimsonDark); v.box(x, 12, 4, x, 14, 6, PAL.window); }
+  roof(v, 0, L);
+  return v;
+}
+
+function buildPomPom() {
+  const v = new Voxels();
+  // Feet and coat
+  v.box(3, 0, 3, 5, 1, 7, PAL.white);
+  v.box(9, 0, 3, 11, 1, 7, PAL.white);
+  v.box(2, 2, 2, 12, 9, 8, PAL.navy);
+  v.box(1, 2, 3, 13, 4, 7, PAL.navy);
+  v.box(6, 2, 8, 8, 9, 8, PAL.crimson);
+  for (const y of [4, 6, 8]) v.set(7, y, 9, PAL.gold);
+  v.box(3, 10, 3, 11, 10, 7, PAL.white);
+  // Arms
+  v.box(0, 5, 4, 1, 9, 6, PAL.navy); v.box(0, 4, 4, 1, 4, 6, PAL.white);
+  v.box(13, 5, 4, 14, 9, 6, PAL.navy); v.box(13, 4, 4, 14, 4, 6, PAL.white);
+  // Head and face
+  v.ellipsoid(7, 15, 5, 6, 5, 5, PAL.white);
+  for (const ex of [4, 5, 9, 10]) for (let y = 14; y <= 16; y++) v.front(ex, y, PAL.black);
+  v.front(5, 16, PAL.white); v.front(10, 16, PAL.white);
+  v.front(3, 13, PAL.pink); v.front(11, 13, PAL.pink);
+  v.front(7, 13, PAL.black);
+  // Droopy ears
+  v.box(-1, 8, 3, 0, 18, 7, PAL.ear); v.box(14, 8, 3, 15, 18, 7, PAL.ear);
+  v.box(0, 17, 3, 2, 19, 7, PAL.ear); v.box(12, 17, 3, 14, 19, 7, PAL.ear);
+  v.box(-1, 8, 3, 0, 9, 7, PAL.earTip); v.box(14, 8, 3, 15, 9, 7, PAL.earTip);
+  // Conductor hat
+  v.cylY(19, 19, 7, 5, 5.4, PAL.navy);
+  v.cylY(20, 23, 7, 5, 4.2, PAL.navy);
+  v.cylY(21, 21, 7, 5, 4.4, PAL.gold);
+  v.cylY(24, 24, 7, 5, 3.2, PAL.navy);
+  v.front(7, 22, PAL.gold); v.front(7, 23, PAL.gold);
+  return v;
+}
+
+function buildRails(len = 120) {
+  const v = new Voxels();
+  for (let x = -len; x <= len; x++) { v.set(x, -1, 0, PAL.cyan); v.set(x, -1, 10, PAL.cyan); }
+  for (let x = -len; x <= len; x += 4) v.box(x, -2, -2, x + 1, -2, 12, PAL.steel);
+  return v;
+}
+
+function buildPlanet() {
+  const v = new Voxels(), R = 14;
+  const bands = ['#3b2a6b', '#5a3d8f', '#7b5cb8', '#a58ad6', '#4a3a7a', '#2b1f52'];
+  for (let x = -R; x <= R; x++) for (let y = -R; y <= R; y++) for (let z = -R; z <= R; z++) {
+    if (x * x + y * y + z * z > R * R) continue;
+    const t = Math.sin(y * .55 + Math.sin(x * .3 + z * .2) * 1.3);
+    v.set(x, y, z, bands[Math.floor((t + 1) / 2 * (bands.length - .01))]);
+  }
+  for (let x = -24; x <= 24; x++) for (let z = -24; z <= 24; z++) {
+    const d = Math.hypot(x, z);
+    if (d >= 18 && d <= 24 && (x * 7 + z * 13) % 5 !== 0) v.set(x, 0, z, d < 20 ? '#c9a45c' : d < 22 ? '#e9d8a6' : '#8f7bc4');
+  }
+  return v;
+}
+
+// ---------- Scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#05060f');
+scene.fog = new THREE.FogExp2('#05060f', .02);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, .1, 500);
+camera.position.set(11, 6, 14);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 2.5, 0);
+controls.enableDamping = true;
+controls.minDistance = 4;
+controls.maxDistance = 60;
+controls.autoRotateSpeed = .8;
+
+scene.add(new THREE.HemisphereLight('#9fb4ff', '#1a0f24', 1.1));
+const sun = new THREE.DirectionalLight('#fff0dd', 2.4);
+sun.position.set(12, 20, 12);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -16, right: 16, top: 16, bottom: -16, near: 1, far: 60 });
+scene.add(sun);
+const rim = new THREE.DirectionalLight('#8a7dff', 1.2);
+rim.position.set(-15, 8, -10);
+scene.add(rim);
+
+const S = .25; // world size of one train voxel
+const train = new THREE.Group();
+train.position.set(-0.6, 0, -5 * S);
+scene.add(train);
+
+const loco = buildLocomotive().build(S);
+train.add(loco);
+const headLight = new THREE.PointLight('#ffe7b0', 6, 12, 1.6);
+headLight.position.set(30 * S, 11 * S, 5 * S);
+loco.add(headLight);
+const chimneyTop = new THREE.Object3D();
+chimneyTop.position.set(21 * S, 22 * S, 5 * S);
+loco.add(chimneyTop);
+
+const carriage = buildCarriage().build(S);
+carriage.position.x = -26 * S;
+train.add(carriage);
+const coupler = new THREE.Mesh(new THREE.BoxGeometry(2 * S, S, S), new THREE.MeshStandardMaterial({ color: PAL.iron }));
+coupler.position.set(-S, 4 * S, 5 * S);
+train.add(coupler);
+
+const PS = .085; // Pom-Pom voxel size
+const pom = buildPomPom().build(PS);
+const pomHolder = new THREE.Group();
+pomHolder.position.set(-14 * S, 20.5 * S + PS / 2, 5 * S);
+pom.position.set(-7 * PS, 0, -5 * PS);
+pomHolder.add(pom);
+train.add(pomHolder);
+
+const rails = buildRails().build(S);
+rails.position.z = -5 * S;
+scene.add(rails);
+
+const planet = buildPlanet().build(.9, { fog: false });
+const planetHolder = new THREE.Group();
+planetHolder.position.set(-40, 16, -60);
+planetHolder.rotation.set(.35, 0, .3);
+planetHolder.add(planet);
+scene.add(planetHolder);
+
+// Stars: a distant static shell plus a near stream that flows past the train
+function starPoints(n, place, size) {
+  const pos = new Float32Array(n * 3), col = new Float32Array(n * 3), c = new THREE.Color();
+  const tints = ['#ffffff', '#cfe0ff', '#ffe6c4', '#e2d4ff'];
+  for (let i = 0; i < n; i++) {
+    place(pos, i * 3);
+    c.set(tints[i % tints.length]).multiplyScalar(.6 + Math.random() * .8);
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return new THREE.Points(g, new THREE.PointsMaterial({ size, vertexColors: true, fog: false, toneMapped: false }));
+}
+scene.add(starPoints(4000, (p, i) => {
+  const v = new THREE.Vector3().randomDirection().multiplyScalar(120 + Math.random() * 120);
+  p[i] = v.x; p[i + 1] = v.y; p[i + 2] = v.z;
+}, .7));
+const STREAM_X = 70;
+const stream = starPoints(700, (p, i) => {
+  p[i] = (Math.random() * 2 - 1) * STREAM_X;
+  p[i + 1] = -12 + Math.random() * 40;
+  p[i + 2] = -45 + Math.random() * 90;
+}, .18);
+scene.add(stream);
+
+// Steam puffs
+const puffGeo = new THREE.BoxGeometry(.3, .3, .3);
+const puffs = Array.from({ length: 36 }, () => {
+  const m = new THREE.Mesh(puffGeo, new THREE.MeshStandardMaterial({ color: '#e8e6f5', transparent: true, opacity: 0, depthWrite: false }));
+  m.userData = { life: 1, vel: new THREE.Vector3() };
+  m.visible = false;
+  scene.add(m);
+  return m;
+});
+let puffTimer = 0;
+const tmp = new THREE.Vector3();
+function spawnPuff() {
+  const p = puffs.find(m => m.userData.life >= 1);
+  if (!p) return;
+  chimneyTop.getWorldPosition(tmp);
+  p.position.copy(tmp);
+  p.rotation.set(Math.random() * 3, Math.random() * 3, 0);
+  p.userData.life = 0;
+  p.userData.vel.set(-3 - Math.random(), 1.6 + Math.random() * .6, (Math.random() - .5) * .6);
+  p.visible = true;
+}
+
+// ---------- Post-processing ----------
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), .5, .4, .95);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- UI ----------
+let running = true;
+const btnRun = document.getElementById('btn-run');
+const btnRotate = document.getElementById('btn-rotate');
+const btnView = document.getElementById('btn-view');
+btnRun.onclick = () => { running = !running; btnRun.setAttribute('aria-pressed', running); };
+btnRotate.onclick = () => {
+  controls.autoRotate = !controls.autoRotate;
+  btnRotate.setAttribute('aria-pressed', controls.autoRotate);
+};
+const views = [
+  { name: '全景', pos: [11, 6, 14], target: [0, 2.5, 0] },
+  { name: '車頭', pos: [13, 3.5, 5], target: [5, 2.5, 0] },
+  { name: '帕姆', pos: [-3.5, 7, 4.5], target: [-4.1, 5.8, 0] },
+  { name: '星球', pos: [8, 3, 16], target: [-20, 10, -30] },
+];
+let viewIdx = 0, flight = null;
+btnView.onclick = () => {
+  viewIdx = (viewIdx + 1) % views.length;
+  const v = views[viewIdx];
+  btnView.textContent = '視角：' + v.name;
+  flight = { pos: new THREE.Vector3(...v.pos), target: new THREE.Vector3(...v.target) };
+};
+controls.addEventListener('start', () => { flight = null; });
+
+// ---------- Loop ----------
+const clock = new THREE.Clock();
+let t = 0, railOffset = 0;
+const SPEED = 6;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), .05);
+  t += dt;
+  const speed = running ? SPEED : 0;
+
+  railOffset = (railOffset + speed * dt) % (4 * S);
+  rails.position.x = -railOffset;
+
+  const sp = stream.geometry.attributes.position;
+  for (let i = 0; i < sp.count; i++) {
+    let x = sp.getX(i) - speed * 1.6 * dt;
+    if (x < -STREAM_X) x += 2 * STREAM_X;
+    sp.setX(i, x);
+  }
+  sp.needsUpdate = true;
+
+  train.position.y = running ? Math.abs(Math.sin(t * 9)) * .025 : 0;
+  pomHolder.position.y = 20.5 * S + PS / 2 + Math.abs(Math.sin(t * 3)) * .08;
+  pomHolder.rotation.y = Math.sin(t * .8) * .35;
+  planet.rotation.y += dt * .05;
+
+  if (running && (puffTimer -= dt) <= 0) { spawnPuff(); puffTimer = .12; }
+  for (const p of puffs) {
+    const u = p.userData;
+    if (u.life >= 1) continue;
+    u.life = Math.min(1, u.life + dt / 1.8);
+    p.position.addScaledVector(u.vel, dt);
+    p.scale.setScalar(1 + u.life * 3);
+    p.material.opacity = .7 * (1 - u.life);
+    if (u.life >= 1) p.visible = false;
+  }
+
+  if (flight) {
+    const k = 1 - Math.pow(.02, dt);
+    camera.position.lerp(flight.pos, k);
+    controls.target.lerp(flight.target, k);
+    if (camera.position.distanceTo(flight.pos) < .02) flight = null;
+  }
+  controls.update();
+  composer.render();
+});
+document.getElementById('loading').remove();
+</script>
+<script>
+  addEventListener('error', () => {
+    const el = document.getElementById('loading');
+    if (el) el.textContent = '載入失敗：請確認可連線至 cdn.jsdelivr.net';
+  });
+</script>
+</body>
+</html>
